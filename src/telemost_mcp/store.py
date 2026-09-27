@@ -1,7 +1,15 @@
-"""Local SQLite copy of synced messages. FTS5 gives search across all synced chats."""
+"""Copy of synced messages with FTS5 search across all synced chats.
+
+The copy lives in memory and is gone when the server exits. With a path it is a file instead:
+readable by the owner only, kept out of Time Machine, and pruned to the retention period.
+"""
 
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
+import time
 from pathlib import Path
 
 SCHEMA = """
@@ -17,16 +25,32 @@ create trigger if not exists messages_au after update on messages begin
     insert into messages_fts(messages_fts, rowid, body, author) values ('delete', old.rowid, old.body, old.author);
     insert into messages_fts(rowid, body, author) values (new.rowid, new.body, new.author);
 end;
+create trigger if not exists messages_ad after delete on messages begin
+    insert into messages_fts(messages_fts, rowid, body, author) values ('delete', old.rowid, old.body, old.author);
+end;
 """
 
 
-class Store:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.executescript(SCHEMA)
+def private_file(path: Path) -> None:
+    """Create the file as owner-only before SQLite opens it; SQLite gives its journal the same mode."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.close(os.open(path, os.O_CREAT | os.O_RDONLY, 0o600))
+    path.chmod(0o600)
+    if shutil.which("tmutil"):
+        subprocess.run(["tmutil", "addexclusion", str(path)], capture_output=True)
 
-    def save(self, chat_name: str | None, messages: list[dict]) -> None:
+
+class Store:
+    def __init__(self, path: Path | None = None, retention_days: int = 14):
+        self.retention_days = retention_days if path else None
+        if path:
+            private_file(path)
+        self.db = sqlite3.connect(path or ":memory:")
+        self.db.executescript(SCHEMA)
+        self.prune()
+
+    def replace(self, chat_id: str, since_mcs: int, chat_name: str, messages: list[dict]) -> None:
+        """Replace the chat's copy from `since_mcs` on, so messages deleted in Telemost leave it too."""
         rows = [
             (
                 m["chat_id"], m["ts_mcs"], chat_name, m.get("author"),
@@ -36,12 +60,20 @@ class Store:
             for m in messages if "chat_id" in m
         ]
         with self.db:
+            self.db.execute("delete from messages where chat_id = ? and ts_mcs >= ?", (chat_id, since_mcs))
             self.db.executemany(
                 """insert into messages values (?, ?, ?, ?, ?, ?)
                    on conflict (chat_id, ts_mcs) do update set
-                   chat_name = coalesce(excluded.chat_name, chat_name), author = excluded.author, body = excluded.body, view = excluded.view""",
+                   chat_name = excluded.chat_name, author = excluded.author, body = excluded.body, view = excluded.view""",
                 rows,
             )
+
+    def prune(self) -> None:
+        if self.retention_days is None:
+            return
+        cutoff = int((time.time() - self.retention_days * 86400) * 1e6)
+        with self.db:
+            self.db.execute("delete from messages where ts_mcs < ?", (cutoff,))
 
     def search(self, query: str, chat_id: str | None, limit: int) -> list[dict]:
         # Each word becomes a quoted prefix term, so FTS syntax in the query cannot break the match.

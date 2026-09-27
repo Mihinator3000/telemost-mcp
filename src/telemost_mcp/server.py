@@ -1,7 +1,8 @@
 """MCP server: read-only tools over Telemost chats (formerly Yandex Messenger).
 
-Live tools call Telemost directly. `sync` copies history into a local SQLite store, and
-`local_search` runs full-text search over that copy across all synced chats.
+Live tools call Telemost directly. `sync` copies history into an in-memory store, and
+`local_search` runs prefix search over that copy across all synced chats. Set TELEMOST_DB to keep
+the copy in a file between sessions, pruned to TELEMOST_RETENTION_DAYS (14 by default).
 """
 
 import asyncio
@@ -25,7 +26,11 @@ mcp = MCPServer(
     ),
 )
 client = Telemost()
-store = Store(Path(os.environ.get("TELEMOST_DB", "~/.local/share/telemost-mcp/messages.db")).expanduser())
+db_path = os.environ.get("TELEMOST_DB")
+store = Store(
+    Path(db_path).expanduser() if db_path else None,
+    retention_days=int(os.environ.get("TELEMOST_RETENTION_DAYS", "14")),
+)
 PAGE = 50
 
 
@@ -108,7 +113,6 @@ async def messages_get(
     messages = await chat_page(chat_id, to_mcs(before) if before else None, limit)
     if include_threads:
         await attach_replies(messages)
-    store.save(None, messages + [r for m in messages for r in m.get("replies", [])])  # `sync` adds chat names.
     return messages
 
 
@@ -119,15 +123,19 @@ async def thread_get(thread_id: str, before: int | str | None = None, limit: int
     `thread_id` is `thread.id` of a message. To page back, pass the oldest reply's `ts_mcs` as `before`.
     """
     replies, chat = await history_page(thread_id, to_mcs(before) if before else None, limit)
-    store.save(None, replies)
     parent = chat.get("ThreadParentMessage")
     return {"parent": message_view(parent) if parent else None, "replies": replies}
 
 
 @mcp.tool()
-async def messages_search(query: str, chat_id: str, limit: int = 50) -> list[dict]:
-    """Server-side full-text search inside one chat. Covers the whole history, not only synced messages."""
-    result = await client.api("search", query=query, chat_id=chat_id, limit=limit, entities=["messages"])
+async def messages_search(query: str, chat_id: str | None = None, limit: int = 50) -> list[dict]:
+    """Server-side search over the whole history, in one chat or, without `chat_id`, in all chats.
+
+    Words match only in the exact form given, so search each likely form separately (релиз, релизы, релиза).
+    The server returns at most 50 hits; narrow a crowded query with `chat_id`.
+    """
+    scope = {"chat_id": chat_id} if chat_id else {}
+    result = await client.api("search", query=query, limit=limit, entities=["messages"], **scope)
     return [
         message_view(hit["data"]) | {"matches": hit.get("matches", {}).get("text")}
         for hit in result["messages"]["items"]
@@ -142,9 +150,10 @@ async def users_get(guids: list[str]) -> list[dict]:
 
 @mcp.tool()
 async def sync(chat_id: str | None = None, days: int = 7) -> dict:
-    """Copy the last `days` of history, thread replies included, into the local store for `local_search`.
+    """Load the last `days` of history, thread replies included, for `local_search`.
 
-    Without `chat_id` it syncs every chat and thread that had activity in that period.
+    Without `chat_id` it loads every chat and thread that had activity in that period.
+    The loaded copy lasts for this session only.
     """
     since = int((time.time() - days * 86400) * 1e6)
     chats = await all_chats()
@@ -162,7 +171,7 @@ async def sync(chat_id: str | None = None, days: int = 7) -> dict:
 
     async def pull(cid: str, name: str) -> list[dict]:
         messages = await fetch_since(cid, since)
-        store.save(name, messages)
+        store.replace(cid, since, name, messages)
         synced[name] = synced.get(name, 0) + len(messages)
         return messages
 
@@ -174,12 +183,16 @@ async def sync(chat_id: str | None = None, days: int = 7) -> dict:
                     threads.setdefault(m["thread"]["id"], f"{name} › thread")
     for tid, name in threads.items():
         await pull(tid, name)
+    store.prune()
     return {"since": iso(since), "threads": len(threads), "synced": synced, "store": store.stats()}
 
 
 @mcp.tool()
 async def local_search(query: str, chat_id: str | None = None, limit: int = 50) -> list[dict]:
-    """Full-text search over synced messages across all chats. Words match as prefixes. Run `sync` first."""
+    """Search messages loaded by `sync` across all chats. Words match as prefixes, so any word form hits.
+
+    Run `sync` first. Prefer it to `messages_search` for "every mention in the last N days" questions.
+    """
     return store.search(query, chat_id, limit)
 
 
