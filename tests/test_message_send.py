@@ -265,7 +265,7 @@ def chat_mode():
 
 async def draft_and_confirm(chat_server, confirms, **arguments):
     async with Client(chat_server) as client:
-        draft = outcome(await client.call_tool("message_send", arguments))
+        draft = outcome(await client.call_tool("message_draft", arguments))
         results = [await client.call_tool("message_confirm", {"draft_id": draft["draft_id"]}) for _ in range(confirms)]
     return draft, results
 
@@ -292,7 +292,7 @@ async def test_chat_mode_confirm_posts_the_draft_once(pushed, chat_mode):
 @pytest.mark.anyio
 async def test_chat_mode_refuses_unknown_and_expired_drafts(pushed, chat_mode):
     async with Client(chat_mode) as client:
-        draft = outcome(await client.call_tool("message_send", {"chat_id": GROUP, "text": "ок"}))
+        draft = outcome(await client.call_tool("message_draft", {"chat_id": GROUP, "text": "ок"}))
         server.drafts[draft["draft_id"]].expires_at = 0
         expired = await client.call_tool("message_confirm", {"draft_id": draft["draft_id"]})
         unknown = await client.call_tool("message_confirm", {"draft_id": "nope"})
@@ -305,8 +305,8 @@ async def test_chat_mode_refuses_unknown_and_expired_drafts(pushed, chat_mode):
 @pytest.mark.anyio
 async def test_chat_mode_checks_text_and_destination_before_drafting(pushed, chat_mode):
     async with Client(chat_mode) as client:
-        hidden_text = await client.call_tool("message_send", {"chat_id": GROUP, "text": "ок​"})
-        stranger = await client.call_tool("message_send", {"chat_id": "0/0/stranger", "text": "ок"})
+        hidden_text = await client.call_tool("message_draft", {"chat_id": GROUP, "text": "ок​"})
+        stranger = await client.call_tool("message_draft", {"chat_id": "0/0/stranger", "text": "ок"})
 
     assert hidden_text.is_error
     assert stranger.is_error
@@ -318,7 +318,8 @@ async def test_chat_mode_marks_only_confirm_as_a_write(chat_mode):
     async with Client(chat_mode) as client:
         tools = {t.name: t.annotations for t in (await client.list_tools()).tools}
 
-    assert tools["message_send"].read_only_hint is True
+    assert set(tools) == {"message_draft", "message_confirm"}
+    assert tools["message_draft"].read_only_hint is True
     assert tools["message_confirm"].destructive_hint is True
 
 

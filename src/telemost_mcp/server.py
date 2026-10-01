@@ -5,8 +5,9 @@ Live tools call Telemost directly. `sync` copies history into an in-memory store
 the copy in a file between sessions, pruned to TELEMOST_RETENTION_DAYS (14 by default).
 
 Posting is the only write, and it needs the user's approval of the exact text and destination.
-TELEMOST_CONFIRM picks who asks: `elicitation` (default) asks in the MCP client, so a client without
-elicitation cannot post; `chat` returns a draft that the model shows and posts with message_confirm.
+TELEMOST_CONFIRM picks who asks: `elicitation` (default) asks in the MCP client through message_send, so a
+client without elicitation cannot post; `chat` swaps message_send for message_draft, a draft the model shows
+the user and posts with message_confirm.
 """
 
 import asyncio
@@ -409,13 +410,13 @@ async def send_draft(
 
 
 async def message_confirm(draft_id: str) -> dict:
-    """Post a draft from message_send. Call only after the user explicitly approved this exact draft.
+    """Post a draft from message_draft. Call only after the user explicitly approved this exact draft.
 
     After an error, read the chat before preparing the message again: it may already be posted.
     """
     draft = drafts.pop(draft_id, None)
     if draft is None or draft.expires_at <= time.time():
-        raise ToolError("No such draft, or it expired; prepare it again with message_send")
+        raise ToolError("No such draft, or it expired; prepare it again with message_draft")
     return await post(draft.target, draft.text)
 
 
@@ -424,7 +425,7 @@ def add_send_tools(server: MCPServer, confirm: str) -> None:
     if confirm == "elicitation":
         server.tool(name="message_send", annotations=WRITE)(send_after_elicitation)
     elif confirm == "chat":
-        server.tool(name="message_send", annotations=DRAFT)(send_draft)
+        server.tool(name="message_draft", annotations=DRAFT)(send_draft)
         server.tool(name="message_confirm", annotations=WRITE)(message_confirm)
     else:
         raise ValueError(f"TELEMOST_CONFIRM must be elicitation or chat, not {confirm!r}")
