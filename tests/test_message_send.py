@@ -325,3 +325,36 @@ async def test_chat_mode_marks_only_confirm_as_a_write(chat_mode):
 def test_unknown_confirm_mode_is_refused():
     with pytest.raises(ValueError, match="TELEMOST_CONFIRM"):
         server.add_send_tools(server.MCPServer("bad"), "auto")
+
+
+@pytest.mark.anyio
+async def test_push_envelope_matches_the_telemost_web_client(monkeypatch):
+    sent: list[tuple[str, dict]] = []
+
+    class FakeXiva:
+        cookie = "Session_id=3:1|42.0; yandexuid=8675309; L=x"
+        subscription_id = "subscription"
+
+        async def call(self, method, body):
+            sent.append((method, body))
+            return {"Status": 1, "MessageInfo": {"TimestampMcs": 1}}
+
+    telemost = telemost_client.Telemost()
+
+    async def session():
+        return FakeXiva()
+
+    monkeypatch.setattr(telemost, "session", session)
+    await telemost.push({"ChatId": GROUP, "PayloadId": "p", "Text": {"MessageText": "ок"}})
+
+    method, body = sent[0]
+    assert method == "push"
+    assert body["UserAgent"] == "telemost-web/212.6.0"
+    assert body["ClientTransportId"] == {"XivaSubscriptionId": "subscription"}
+    assert body["ClientMessage"]["LogData"] == {"YandexUid": "8675309"}
+    assert body["Meta"] == {"Origin": 27}
+
+
+def test_push_needs_the_yandexuid_cookie():
+    with pytest.raises(telemost_client.TelemostError, match="yandexuid"):
+        telemost_client.browser_id("Session_id=3:1|42.0; L=x")

@@ -43,8 +43,8 @@ API_HEADERS = {
 # The web client writes 5 into byte 0 of this header and leaves the rest empty.
 PAYLOAD_HEADER = b"\x05" + bytes(11)
 DATA, PROXY_STATUS = 1, 2
-# `push` envelope fields as the Yandex Messenger web client sends them (chats-web 3.22.0).
-PUSH_USER_AGENT = "chats-web/3.22.0"
+# `push` envelope fields as the Telemost web client 212.6.0 sends them.
+PUSH_USER_AGENT = "telemost-web/212.6.0"
 # A posted message comes back FULLY_COMMITTED; a repeated PayloadId comes back DUPLICATE and posts nothing new.
 PUSH_COMMITTED = {1: "FULLY_COMMITTED", 8: "DUPLICATE"}
 PUSH_STATUSES = PUSH_COMMITTED | {
@@ -79,6 +79,14 @@ def cookie_header() -> str:
             f"from DevTools into {ENV_FILE} as TELEMOST_COOKIE=..."
         )
     return cookie
+
+
+def browser_id(cookie: str) -> str:
+    """The `yandexuid` cookie: the web client logs it as YandexUid, and the backend rejects a push without it."""
+    match = re.search(r"(?:^|;\s*)yandexuid=(\d+)", cookie)
+    if match is None:
+        raise TelemostError("The cookie has no yandexuid; copy the whole Cookie header again")
+    return match.group(1)
 
 
 class Xiva:
@@ -192,7 +200,7 @@ class Telemost:
         body = {
             "ClientTransportId": {"XivaSubscriptionId": xiva.subscription_id},
             "UserAgent": PUSH_USER_AGENT,
-            "ClientMessage": {"Plain": plain, "LogData": {"YandexUid": self.me["uid"]}},
+            "ClientMessage": {"Plain": plain, "LogData": {"YandexUid": browser_id(xiva.cookie)}},
             "Meta": {"Origin": ORIGIN_SERVICE_ID},
             "ClientSupportedFeatures": 0,
         }
