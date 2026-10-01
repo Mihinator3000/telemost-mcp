@@ -11,15 +11,17 @@ in an MCP elicitation, so a client without elicitation cannot post at all.
 import asyncio
 import os
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Annotated
 
 from mcp.server.mcpserver import Elicit, ElicitationResult, MCPServer, Resolve
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from telemost_mcp.client import Telemost
+from telemost_mcp.client import Telemost, TelemostError
 from telemost_mcp.store import Store
 from telemost_mcp.views import chat_view, iso, message_view, thread_id, to_mcs, user_view
 
@@ -41,6 +43,10 @@ store = Store(
 )
 PAGE = 50
 QUOTE_LENGTH = 200
+TEXT_LENGTH = 6000
+READ = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
+SCRIPTS = ("LATIN", "CYRILLIC", "GREEK")
 
 
 async def all_chats() -> list[dict]:
@@ -79,14 +85,14 @@ async def fetch_since(chat_id: str, since_mcs: int) -> list[dict]:
         before = page[0]["ts_mcs"]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def whoami() -> dict:
     """The logged-in user: name, email, uid, guid and organization."""
     await client.fanout("whoami", {})
     return client.me
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def chats_list(query: str | None = None, limit: int = 50) -> list[dict]:
     """Chats sorted by last activity. `query` filters by a case-insensitive substring of the chat name."""
     chats = [chat_view(c) for c in await all_chats()]
@@ -95,7 +101,7 @@ async def chats_list(query: str | None = None, limit: int = 50) -> list[dict]:
     return chats[:limit]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def chat_info(chat_id: str) -> dict:
     """Chat name, description, your role, and members with their positions and departments."""
     chat = (await client.api("get_chats_info", chat_ids=[chat_id]))["chats"][0]
@@ -110,7 +116,7 @@ async def chat_info(chat_id: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def messages_get(
     chat_id: str, before: int | str | None = None, limit: int = PAGE, include_threads: bool = True
 ) -> list[dict]:
@@ -125,7 +131,7 @@ async def messages_get(
     return messages
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def thread_get(thread_id: str, before: int | str | None = None, limit: int = PAGE) -> dict:
     """The parent message and the replies of a thread, oldest first.
 
@@ -136,7 +142,7 @@ async def thread_get(thread_id: str, before: int | str | None = None, limit: int
     return {"parent": message_view(parent) if parent else None, "replies": replies}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def messages_search(query: str, chat_id: str | None = None, limit: int = 50) -> list[dict]:
     """Server-side search over the whole history, in one chat or, without `chat_id`, in all chats.
 
@@ -151,13 +157,13 @@ async def messages_search(query: str, chat_id: str | None = None, limit: int = 5
     ]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def users_get(guids: list[str]) -> list[dict]:
     """Name, email, position and department for user guids (for example `author_guid` from messages)."""
     return [user_view(u) for u in (await client.api("get_users_data", guids=guids))["users"]]
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def sync(chat_id: str | None = None, days: int = 7) -> dict:
     """Load the last `days` of history, thread replies included, for `local_search`.
 
@@ -196,7 +202,7 @@ async def sync(chat_id: str | None = None, days: int = 7) -> dict:
     return {"since": iso(since), "threads": len(threads), "synced": synced, "store": store.stats()}
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ)
 async def local_search(query: str, chat_id: str | None = None, limit: int = 50) -> list[dict]:
     """Search messages loaded by `sync` across all chats. Words match as prefixes, so any word form hits.
 
@@ -210,6 +216,7 @@ class SendTarget(BaseModel):
 
     chat_id: str
     where: str
+    warnings: list[str] = []
     parent: dict | None = None
     reply: dict | None = None
 
@@ -218,9 +225,39 @@ class SendConfirmation(BaseModel):
     send: bool = Field(default=False, title="Отправить", description="Отметьте, чтобы сообщение ушло от вашего имени")
 
 
+def one_line(value: str) -> str:
+    """Other people's text flattened to one line, so it cannot pose as another line of the confirmation."""
+    return " ".join("".join(" " if unicodedata.category(c)[0] in "CZ" else c for c in value).split())
+
+
+def hidden(c: str) -> bool:
+    """Characters that do not show up as text: they could carry content the user never saw, or redraw the dialog."""
+    if c in "\n\t":
+        return False
+    invisible = unicodedata.category(c) in ("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp")
+    return invisible or "VARIATION SELECTOR" in unicodedata.name(c, "")
+
+
+def scripts(word: str) -> set[str]:
+    return {unicodedata.name(c, "").split(" ")[0] for c in word if c.isalpha()} & set(SCRIPTS)
+
+
+def mixed_script(name: str) -> bool:
+    """A word mixing Latin, Cyrillic or Greek letters, the usual way to forge a familiar chat name."""
+    return any(len(scripts(word)) > 1 for word in name.split())
+
+
+def look_alike(name: str) -> str:
+    return unicodedata.normalize("NFKC", name).casefold()
+
+
 def excerpt(message: dict) -> str:
-    text = message.get("text") or ", ".join(message.get("files", [])) or "(вложение)"
+    text = one_line(message.get("text") or ", ".join(message.get("files", [])) or "(вложение)")
     return text if len(text) <= QUOTE_LENGTH else text[:QUOTE_LENGTH] + "…"
+
+
+def signed(message: dict) -> str:
+    return f"{one_line(message.get('author') or '?')}: {excerpt(message)}"
 
 
 async def message_at(chat_id: str, ts_mcs: int) -> dict:
@@ -230,41 +267,75 @@ async def message_at(chat_id: str, ts_mcs: int) -> dict:
     return page[-1]
 
 
-def thread_owner(chat_id: str, names: dict[str, str]) -> str | None:
+def thread_parent_ts(thread: str) -> int:
+    ts = thread.rpartition("_")[2]
+    if not (ts.isascii() and ts.isdigit()):
+        raise ToolError(f"{thread} is not a thread id")
+    return int(ts)
+
+
+def thread_owner(chat_id: str, chats: dict) -> str | None:
     """The chat a thread id belongs to: a thread id is `<prefix>_<parent ts>`, and the prefix maps to its chat."""
     prefix = chat_id.rsplit("_", 1)[0]
-    return next((cid for cid in names if thread_id(cid, 0).rsplit("_", 1)[0] == prefix), None)
+    return next((cid for cid in chats if thread_id(cid, 0).rsplit("_", 1)[0] == prefix), None)
+
+
+def chat_label(chat: dict, thread: bool) -> str:
+    """Chat kind and size next to its name: anyone can name a group after a person or another chat."""
+    name = one_line(chat["name"]).replace("«", '"').replace("»", '"')
+    if chat["kind"] == "private":
+        return f"{'тред в личном чате' if thread else 'личный чат'} с «{name}»"
+    return f"{'тред в группе' if thread else 'группу'} «{name}» (участников: {chat.get('members', '?')})"
+
+
+def name_warnings(chat: dict, chats: dict[str, dict]) -> list[str]:
+    warnings = []
+    if mixed_script(chat["name"]):
+        warnings.append("⚠ В названии в одном слове смешаны латиница и кириллица: возможна подделка.")
+    if any(look_alike(c["name"]) == look_alike(chat["name"]) for c in chats.values() if c is not chat):
+        warnings.append("⚠ У вас есть другой чат с таким же названием.")
+    return warnings
 
 
 async def send_target(chat_id: str, thread_of: int | str | None, reply_to: int | str | None) -> SendTarget:
-    names = {c["ChatId"]: chat_view(c)["name"] for c in await all_chats()}
-    if chat_id in names:
-        where = f"чат «{names[chat_id]}»"
-    elif not thread_of and (owner := thread_owner(chat_id, names)):
-        where = f"тред в чате «{names[owner]}»"
+    chats = {c["ChatId"]: chat_view(c) for c in await all_chats()}
+    if chat_id in chats:
+        owner = chat_id
+        parent = await message_at(chat_id, to_mcs(thread_of)) if thread_of else None
+    elif not thread_of and (owner := thread_owner(chat_id, chats)):
+        parent = await message_at(owner, thread_parent_ts(chat_id))
     else:
         raise ToolError("chat_id must be your chat, or, without thread_of, a thread of your chat")
-    parent = await message_at(chat_id, to_mcs(thread_of)) if thread_of else None
     if parent:
-        chat_id, where = thread_id(chat_id, parent["ts_mcs"]), f"тред в {where}"
+        chat_id = thread_id(owner, parent["ts_mcs"])
     reply = await message_at(chat_id, to_mcs(reply_to)) if reply_to else None
-    return SendTarget(chat_id=chat_id, where=where, parent=parent, reply=reply)
+    return SendTarget(
+        chat_id=chat_id,
+        where=chat_label(chats[owner], thread=parent is not None),
+        warnings=name_warnings(chats[owner], chats),
+        parent=parent,
+        reply=reply,
+    )
 
 
 async def ask_to_send(target: Annotated[SendTarget, Resolve(send_target)], text: str) -> Elicit[SendConfirmation]:
     """Show the user exactly what is posted and where; only the user can approve it."""
     if not text.strip():
         raise ToolError("text is empty")
-    lines = [f"Отправить от вашего имени в {target.where}?"]
+    if len(text) > TEXT_LENGTH:
+        raise ToolError(f"text is longer than {TEXT_LENGTH} characters")
+    if invisible := sorted({f"U+{ord(c):04X}" for c in text if hidden(c)}):
+        raise ToolError(f"text contains characters the user cannot see; remove {', '.join(invisible[:10])}")
+    lines = [f"Отправить от вашего имени в {target.where}?", *target.warnings]
     if target.parent:
-        lines.append(f"Тред под сообщением — {target.parent.get('author')}: {excerpt(target.parent)}")
+        lines.append(f"Тред под сообщением — {signed(target.parent)}")
     if target.reply:
-        lines.append(f"Ответ на сообщение — {target.reply.get('author')}: {excerpt(target.reply)}")
-    lines += ["", "Текст:", text]
+        lines.append(f"Ответ на сообщение — {signed(target.reply)}")
+    lines += ["", f"Текст ({len(text)} симв.):", *(f"│ {line}" for line in text.split("\n"))]
     return Elicit("\n".join(lines), SendConfirmation)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def message_send(
     chat_id: str,
     text: str,
@@ -287,7 +358,11 @@ async def message_send(
     if target.reply:
         plain["ForwardedMessageRefs"] = [{"ChatId": target.chat_id, "Timestamp": target.reply["ts_mcs"]}]
         plain["ForwardedMessageStyles"] = [{"Quote": excerpt(target.reply)}]
-    posted_mcs = ((await client.push(plain)).get("MessageInfo") or {}).get("TimestampMcs")
+    try:
+        posted = await client.push(plain)
+    except TelemostError as error:
+        raise ToolError(str(error)) from error
+    posted_mcs = (posted.get("MessageInfo") or {}).get("TimestampMcs")
     return {"sent": True, "chat_id": target.chat_id, "ts_mcs": posted_mcs, "ts": iso(posted_mcs)}
 
 

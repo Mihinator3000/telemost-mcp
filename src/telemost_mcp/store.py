@@ -46,6 +46,8 @@ class Store:
         if path:
             private_file(path)
         self.db = sqlite3.connect(path or ":memory:")
+        # Pruned and replaced messages are overwritten on disk instead of lingering in free pages.
+        self.db.execute("pragma secure_delete = on")
         self.db.executescript(SCHEMA)
         self.prune()
 

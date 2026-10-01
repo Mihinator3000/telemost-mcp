@@ -10,6 +10,7 @@ The protocol is reverse-engineered from web client 211.3.0. Yandex can change it
 import asyncio
 import itertools
 import json
+import logging
 import os
 import re
 import secrets
@@ -54,6 +55,10 @@ PUSH_STATUSES = PUSH_COMMITTED | {
 }
 
 
+# websockets logs the handshake headers, the session Cookie included, at DEBUG.
+logging.getLogger("websockets").setLevel(logging.INFO)
+
+
 class TelemostError(RuntimeError):
     pass
 
@@ -63,6 +68,8 @@ ENV_FILE = Path(os.environ.get("TELEMOST_ENV", "~/.config/telemost-mcp/.env")).e
 
 def cookie_header() -> str:
     """Read TELEMOST_COOKIE from the env file on every call, so a re-pasted cookie applies without a restart."""
+    if ENV_FILE.exists() and ENV_FILE.stat().st_mode & 0o077:
+        raise TelemostError(f"{ENV_FILE} is open to other users; restrict it with chmod 600 {ENV_FILE}")
     lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
     values = dict(line.split("=", 1) for line in lines if line.startswith("TELEMOST_COOKIE="))
     cookie = values.get("TELEMOST_COOKIE", os.environ.get("TELEMOST_COOKIE", "")).strip().strip("'\"")
