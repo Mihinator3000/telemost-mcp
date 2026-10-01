@@ -1,16 +1,23 @@
-"""MCP server: read-only tools over Telemost chats (formerly Yandex Messenger).
+"""MCP server: tools over Telemost chats (formerly Yandex Messenger).
 
 Live tools call Telemost directly. `sync` copies history into an in-memory store, and
 `local_search` runs prefix search over that copy across all synced chats. Set TELEMOST_DB to keep
 the copy in a file between sessions, pruned to TELEMOST_RETENTION_DAYS (14 by default).
+
+`message_send` is the only write. It posts only after the user approves the exact text and destination
+in an MCP elicitation, so a client without elicitation cannot post at all.
 """
 
 import asyncio
 import os
 import time
+import uuid
 from pathlib import Path
+from typing import Annotated
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Elicit, ElicitationResult, MCPServer, Resolve
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import BaseModel, Field
 
 from telemost_mcp.client import Telemost
 from telemost_mcp.store import Store
@@ -19,10 +26,11 @@ from telemost_mcp.views import chat_view, iso, message_view, thread_id, to_mcs, 
 mcp = MCPServer(
     "telemost",
     instructions=(
-        "Read-only access to the user's Yandex Telemost work chats. "
+        "Access to the user's Yandex Telemost work chats. "
         "Find a chat_id with chats_list, then read it with messages_get or search it with messages_search. "
         "Messages that start a thread carry `thread` and inline `replies`; page long threads with thread_get. "
-        "Timestamps are ISO 8601 in local time."
+        "Timestamps are ISO 8601 in local time. "
+        "message_send is the only write: it posts as the user after the user confirms it in the client."
     ),
 )
 client = Telemost()
@@ -32,6 +40,7 @@ store = Store(
     retention_days=int(os.environ.get("TELEMOST_RETENTION_DAYS", "14")),
 )
 PAGE = 50
+QUOTE_LENGTH = 200
 
 
 async def all_chats() -> list[dict]:
@@ -194,6 +203,92 @@ async def local_search(query: str, chat_id: str | None = None, limit: int = 50) 
     Run `sync` first. Prefer it to `messages_search` for "every mention in the last N days" questions.
     """
     return store.search(query, chat_id, limit)
+
+
+class SendTarget(BaseModel):
+    """Where a message goes, checked against the user's own chats before the user is asked."""
+
+    chat_id: str
+    where: str
+    parent: dict | None = None
+    reply: dict | None = None
+
+
+class SendConfirmation(BaseModel):
+    send: bool = Field(default=False, title="Отправить", description="Отметьте, чтобы сообщение ушло от вашего имени")
+
+
+def excerpt(message: dict) -> str:
+    text = message.get("text") or ", ".join(message.get("files", [])) or "(вложение)"
+    return text if len(text) <= QUOTE_LENGTH else text[:QUOTE_LENGTH] + "…"
+
+
+async def message_at(chat_id: str, ts_mcs: int) -> dict:
+    page = await chat_page(chat_id, ts_mcs + 1, 1)
+    if not page or page[-1]["ts_mcs"] != ts_mcs:
+        raise ToolError(f"No message {ts_mcs} in {chat_id}")
+    return page[-1]
+
+
+def thread_owner(chat_id: str, names: dict[str, str]) -> str | None:
+    """The chat a thread id belongs to: a thread id is `<prefix>_<parent ts>`, and the prefix maps to its chat."""
+    prefix = chat_id.rsplit("_", 1)[0]
+    return next((cid for cid in names if thread_id(cid, 0).rsplit("_", 1)[0] == prefix), None)
+
+
+async def send_target(chat_id: str, thread_of: int | str | None, reply_to: int | str | None) -> SendTarget:
+    names = {c["ChatId"]: chat_view(c)["name"] for c in await all_chats()}
+    if chat_id in names:
+        where = f"чат «{names[chat_id]}»"
+    elif not thread_of and (owner := thread_owner(chat_id, names)):
+        where = f"тред в чате «{names[owner]}»"
+    else:
+        raise ToolError("chat_id must be your chat, or, without thread_of, a thread of your chat")
+    parent = await message_at(chat_id, to_mcs(thread_of)) if thread_of else None
+    if parent:
+        chat_id, where = thread_id(chat_id, parent["ts_mcs"]), f"тред в {where}"
+    reply = await message_at(chat_id, to_mcs(reply_to)) if reply_to else None
+    return SendTarget(chat_id=chat_id, where=where, parent=parent, reply=reply)
+
+
+async def ask_to_send(target: Annotated[SendTarget, Resolve(send_target)], text: str) -> Elicit[SendConfirmation]:
+    """Show the user exactly what is posted and where; only the user can approve it."""
+    if not text.strip():
+        raise ToolError("text is empty")
+    lines = [f"Отправить от вашего имени в {target.where}?"]
+    if target.parent:
+        lines.append(f"Тред под сообщением — {target.parent.get('author')}: {excerpt(target.parent)}")
+    if target.reply:
+        lines.append(f"Ответ на сообщение — {target.reply.get('author')}: {excerpt(target.reply)}")
+    lines += ["", "Текст:", text]
+    return Elicit("\n".join(lines), SendConfirmation)
+
+
+@mcp.tool()
+async def message_send(
+    chat_id: str,
+    text: str,
+    target: Annotated[SendTarget, Resolve(send_target)],
+    confirmation: Annotated[ElicitationResult[SendConfirmation], Resolve(ask_to_send)],
+    thread_of: int | str | None = None,
+    reply_to: int | str | None = None,
+) -> dict:
+    """Post a text message as the user, after the user confirms the exact text and destination.
+
+    The client shows the user a confirmation; nothing is posted unless the user approves it there.
+    `chat_id` is a chat from chats_list or a thread id (`thread.id` of a message).
+    `thread_of` is `ts_mcs` of a message in `chat_id`: the message goes into its thread, which starts if absent.
+    `reply_to` is `ts_mcs` of a message in the destination to quote.
+    After an error, read the chat before sending again: the message may already be posted.
+    """
+    if confirmation.action != "accept" or not confirmation.data.send:
+        return {"sent": False, "reason": "the user did not confirm"}
+    plain = {"ChatId": target.chat_id, "PayloadId": str(uuid.uuid4()), "Text": {"MessageText": text}}
+    if target.reply:
+        plain["ForwardedMessageRefs"] = [{"ChatId": target.chat_id, "Timestamp": target.reply["ts_mcs"]}]
+        plain["ForwardedMessageStyles"] = [{"Quote": excerpt(target.reply)}]
+    posted_mcs = ((await client.push(plain)).get("MessageInfo") or {}).get("TimestampMcs")
+    return {"sent": True, "chat_id": target.chat_id, "ts_mcs": posted_mcs, "ts": iso(posted_mcs)}
 
 
 def main() -> None:

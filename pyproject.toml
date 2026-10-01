@@ -1,7 +1,7 @@
 [project]
 name = "telemost-mcp"
 version = "0.1.0"
-description = "Read-only MCP server for Yandex Telemost chats over the web client's private API."
+description = "MCP server for Yandex Telemost chats over the web client's private API: reads, and posts only with the user's confirmation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,3 +17,8 @@ telemost-mcp = "telemost_mcp.server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

@@ -30,9 +30,10 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
+ORIGIN_SERVICE_ID = 27
 API_HEADERS = {
     "X-Application-Id": "Yamb-web",
-    "X-Origin-Service-ID": "27",
+    "X-Origin-Service-ID": str(ORIGIN_SERVICE_ID),
     "X-Version": "5",
     "Origin": ORIGIN,
     "Referer": ORIGIN + "/",
@@ -41,6 +42,16 @@ API_HEADERS = {
 # The web client writes 5 into byte 0 of this header and leaves the rest empty.
 PAYLOAD_HEADER = b"\x05" + bytes(11)
 DATA, PROXY_STATUS = 1, 2
+# `push` envelope fields as the Yandex Messenger web client sends them (chats-web 3.22.0).
+PUSH_USER_AGENT = "chats-web/3.22.0"
+# A posted message comes back FULLY_COMMITTED; a repeated PayloadId comes back DUPLICATE and posts nothing new.
+PUSH_COMMITTED = {1: "FULLY_COMMITTED", 8: "DUPLICATE"}
+PUSH_STATUSES = PUSH_COMMITTED | {
+    0: "UNCOMMITTED", 2: "UNIPROXY_COMMITTED", 3: "FAILED", 4: "NO_SUCH_CHAT", 5: "NOT_LEADING",
+    6: "FOREIGN_PARTITION", 7: "SENDER_NOT_IN_CHAT", 9: "POSTPROC_COMMITTED", 10: "KIKIMR_WRITE_FAILED",
+    11: "MESSAGE_NOT_FOUND", 12: "DEQUEUED_AFTER_ERROR", 13: "BAD_REQUEST", 14: "FILESHARE_FAILED",
+    15: "NO_PERMISSION", 16: "CONFLICT", 17: "NO_SUCH_USER", 18: "THROTTLED",
+}
 
 
 class TelemostError(RuntimeError):
@@ -71,6 +82,7 @@ class Xiva:
         self.uid = uid
         self.pending: dict[int, asyncio.Future] = {}
         self.req_ids = itertools.count(1)
+        self.subscription_id: str | None = None
 
     async def connect(self) -> None:
         session = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(19))
@@ -82,11 +94,13 @@ class Xiva:
             additional_headers={"Cookie": self.cookie, "Origin": ORIGIN, "User-Agent": USER_AGENT},
             max_size=None,
         )
-        # The server confirms the subscription before it accepts requests.
+        # The server confirms the subscription before it accepts requests; `push` must carry its id.
         async with asyncio.timeout(10):
             async for frame in self.ws:
-                operation = json.loads(frame).get("operation") if isinstance(frame, str) else None
+                event = json.loads(frame) if isinstance(frame, str) else {}
+                operation = event.get("operation")
                 if operation == "subscribed":
+                    self.subscription_id = event.get("subscription-id")
                     break
                 if operation == "xivaws-error":
                     raise TelemostError(f"Xiva refused the connection: {frame}")
@@ -154,11 +168,35 @@ class Telemost:
             raise TelemostError(f"{method} failed: {body}")
         return body["data"]
 
-    async def fanout(self, method: str, body: dict) -> dict:
+    async def session(self) -> Xiva:
         async with self.lock:
             if self.xiva is None or not self.xiva.alive:
                 await self.login()
-        return await self.xiva.call(method, body)
+        return self.xiva
+
+    async def fanout(self, method: str, body: dict) -> dict:
+        return await (await self.session()).call(method, body)
+
+    async def push(self, plain: dict) -> dict:
+        """Post one `ClientMessage.Plain`. It is never retried: a retry could post the message twice."""
+        xiva = await self.session()
+        if not xiva.subscription_id:
+            raise TelemostError("Xiva sent no subscription id, so a message cannot be posted")
+        body = {
+            "ClientTransportId": {"XivaSubscriptionId": xiva.subscription_id},
+            "UserAgent": PUSH_USER_AGENT,
+            "ClientMessage": {"Plain": plain, "LogData": {"YandexUid": self.me["uid"]}},
+            "Meta": {"Origin": ORIGIN_SERVICE_ID},
+            "ClientSupportedFeatures": 0,
+        }
+        try:
+            result = await xiva.call("push", body)
+        except TimeoutError:
+            raise TelemostError("No answer to push: the message may or may not be posted, read the chat before resending")
+        status = result.get("Status")
+        if status not in PUSH_COMMITTED:
+            raise TelemostError(f"push not committed: {PUSH_STATUSES.get(status, status)}")
+        return result
 
     async def login(self) -> None:
         cookie = cookie_header()
